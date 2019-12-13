@@ -6,6 +6,7 @@ from copy import deepcopy
 
 import stripe
 from stripe import api_requestor, util, six
+from stripe.http_client import AsyncClient
 
 
 def _compute_diff(current, previous):
@@ -241,6 +242,21 @@ class StripeObject(dict):
             account=self.stripe_account,
         )
         response, api_key = requestor.request(method, url, params, headers)
+
+        return util.convert_to_stripe_object(
+            response, api_key, self.stripe_version, self.stripe_account
+        )
+
+    async def async_request(self, method, url, params=None, headers=None):
+        if params is None:
+            params = self._retrieve_params
+        requestor = api_requestor.APIRequestor(
+            key=self.api_key,
+            api_base=self.api_base(),
+            api_version=self.stripe_version,
+            account=self.stripe_account,
+        )
+        response, api_key = await requestor.async_request(method, url, params, headers)
 
         return util.convert_to_stripe_object(
             response, api_key, self.stripe_version, self.stripe_account

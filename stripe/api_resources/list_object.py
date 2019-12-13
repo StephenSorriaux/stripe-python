@@ -2,7 +2,7 @@ from __future__ import absolute_import, division, print_function
 
 from stripe import api_requestor, six, util
 from stripe.stripe_object import StripeObject
-
+from stripe.http_client import AsyncClient
 from stripe.six.moves.urllib.parse import quote_plus
 
 
@@ -13,6 +13,20 @@ class ListObject(StripeObject):
         self, api_key=None, stripe_version=None, stripe_account=None, **params
     ):
         stripe_object = self._request(
+            "get",
+            self.get("url"),
+            api_key=api_key,
+            stripe_version=stripe_version,
+            stripe_account=stripe_account,
+            **params
+        )
+        stripe_object._retrieve_params = params
+        return stripe_object
+
+    async def async_list(
+        self, api_key=None, stripe_version=None, stripe_account=None, **params
+    ):
+        stripe_object = await self._async_request(
             "get",
             self.get("url"),
             api_key=api_key,
@@ -83,6 +97,30 @@ class ListObject(StripeObject):
         )
         return stripe_object
 
+    async def _async_request(
+        self,
+        method_,
+        url_,
+        api_key=None,
+        idempotency_key=None,
+        stripe_version=None,
+        stripe_account=None,
+        **params
+    ):
+        api_key = api_key or self.api_key
+        stripe_version = stripe_version or self.stripe_version
+        stripe_account = stripe_account or self.stripe_account
+
+        requestor = api_requestor.APIRequestor(
+            api_key, api_version=stripe_version, account=stripe_account,
+        )
+        headers = util.populate_headers(idempotency_key)
+        response, api_key = await requestor.async_request(method_, url_, params, headers)
+        stripe_object = util.convert_to_stripe_object(
+            response, api_key, stripe_version, stripe_account
+        )
+        return stripe_object
+
     def __getitem__(self, k):
         if isinstance(k, six.string_types):
             return super(ListObject, self).__getitem__(k)
@@ -118,6 +156,25 @@ class ListObject(StripeObject):
                 for item in page:
                     yield item
                 page = page.next_page()
+
+            if page.is_empty:
+                break
+
+    async def async_auto_paging_iter(self):
+        page = self
+
+        while True:
+            if (
+                "ending_before" in self._retrieve_params
+                and "starting_after" not in self._retrieve_params
+            ):
+                for item in reversed(page):
+                    yield item
+                page = await page.async_previous_page()
+            else:
+                for item in page:
+                    yield item
+                page = await page.async_next_page()
 
             if page.is_empty:
                 break
@@ -161,6 +218,29 @@ class ListObject(StripeObject):
             **params_with_filters
         )
 
+    async def async_next_page(
+        self, api_key=None, stripe_version=None, stripe_account=None, **params
+    ):
+        if not self.has_more:
+            return self.empty_list(
+                api_key=api_key,
+                stripe_version=stripe_version,
+                stripe_account=stripe_account,
+            )
+
+        last_id = self.data[-1].id
+
+        params_with_filters = self._retrieve_params.copy()
+        params_with_filters.update({"starting_after": last_id})
+        params_with_filters.update(params)
+
+        return await self.async_list(
+            api_key=api_key,
+            stripe_version=stripe_version,
+            stripe_account=stripe_account,
+            **params_with_filters
+        )
+
     def previous_page(
         self, api_key=None, stripe_version=None, stripe_account=None, **params
     ):
@@ -178,6 +258,29 @@ class ListObject(StripeObject):
         params_with_filters.update(params)
 
         return self.list(
+            api_key=api_key,
+            stripe_version=stripe_version,
+            stripe_account=stripe_account,
+            **params_with_filters
+        )
+
+    async def async_previous_page(
+        self, api_key=None, stripe_version=None, stripe_account=None, **params
+    ):
+        if not self.has_more:
+            return self.empty_list(
+                api_key=api_key,
+                stripe_version=stripe_version,
+                stripe_account=stripe_account,
+            )
+
+        first_id = self.data[0].id
+
+        params_with_filters = self._retrieve_params.copy()
+        params_with_filters.update({"ending_before": first_id})
+        params_with_filters.update(params)
+
+        return await self.async_list(
             api_key=api_key,
             stripe_version=stripe_version,
             stripe_account=stripe_account,

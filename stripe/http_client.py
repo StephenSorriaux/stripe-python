@@ -1,5 +1,6 @@
 from __future__ import absolute_import, division, print_function
 
+import asyncio
 import sys
 import textwrap
 import warnings
@@ -61,6 +62,11 @@ except ImportError:
 
 # proxy support for the pycurl client
 from stripe.six.moves.urllib.parse import urlparse
+
+try:
+    import aiohttp
+except ImportError:
+    aiohttp = None
 
 
 def _now_ms():
@@ -142,6 +148,45 @@ class HTTPClient(object):
                     )
                 )
                 time.sleep(sleep_time)
+            else:
+                if response is not None:
+                    self._record_request_metrics(response, request_start)
+
+                    return response
+                else:
+                    raise connection_error
+
+    async def async_request_with_retries(self, method, url, headers, post_data=None):
+        self._add_telemetry_header(headers)
+
+        num_retries = 0
+
+        while True:
+            request_start = _now_ms()
+
+            try:
+                response = await self.request(method, url, headers, post_data)
+                connection_error = None
+            except error.APIConnectionError as e:
+                connection_error = e
+                response = None
+
+            if self._should_retry(response, connection_error, num_retries):
+                if connection_error:
+                    util.log_info(
+                        "Encountered a retryable error %s"
+                        % connection_error.user_message
+                    )
+                num_retries += 1
+                sleep_time = self._sleep_time_seconds(num_retries, response)
+                util.log_info(
+                    (
+                        "Initiating retry %i for request %s %s after "
+                        "sleeping %.2f seconds."
+                        % (num_retries, method, url, sleep_time)
+                    )
+                )
+                await asyncio.sleep(sleep_time)
             else:
                 if response is not None:
                     self._record_request_metrics(response, request_start)
@@ -618,3 +663,99 @@ class Urllib2Client(HTTPClient):
 
     def close(self):
         pass
+
+
+class AsyncClient(HTTPClient):
+    name = "aiohttp"
+
+    def __init__(self, timeout=80, session=None, **kwargs):
+        super(AsyncClient, self).__init__(**kwargs)
+        self._session = session
+        self._timeout = timeout
+
+    async def request(self, method, url, headers, post_data=None):
+        kwargs = {}
+
+        if self._session is None:
+            self._session = aiohttp.ClientSession()
+
+        try:
+            try:
+                result = await self._session.request(method, url, headers=headers, data=post_data, timeout=self._timeout, **kwargs)
+                content = await result.read()
+                status_code = result.status
+                headers = result.headers
+            except TypeError as e:
+                raise TypeError(
+                    "Warning: It looks like your installed version of the "
+                    '"requests" library is not compatible with Stripe\'s '
+                    "usage thereof. (HINT: The most likely cause is that "
+                    'your "requests" library is out of date. You can fix '
+                    'that by running "pip install -U requests".) The '
+                    "underlying error was: %s" % (e,)
+                )
+
+            # This causes the content to actually be read, which could cause
+            # e.g. a socket timeout. TODO: The other fetch methods probably
+            # are susceptible to the same and should be updated.
+
+        except Exception as e:
+            # Would catch just requests.exceptions.RequestException, but can
+            # also raise ValueError, RuntimeError, etc.
+            self._handle_request_error(e)
+        return content, status_code, headers
+
+    def _handle_request_error(self, e):
+
+        # Catch SSL error first as it belongs to ConnectionError,
+        # but we don't want to retry
+        if isinstance(e, aiohttp.ClientSSLError):
+            msg = (
+                "Could not verify Stripe's SSL certificate.  Please make "
+                "sure that your network is not intercepting certificates.  "
+                "If this problem persists, let us know at "
+                "support@stripe.com."
+            )
+            err = "%s: %s" % (type(e).__name__, str(e))
+            should_retry = False
+        # Retry only timeout and connect errors; similar to urllib3 Retry
+        elif isinstance(
+            e,
+            (asyncio.TimeoutError, aiohttp.ClientConnectionError),
+        ):
+            msg = (
+                "Unexpected error communicating with Stripe.  "
+                "If this problem persists, let us know at "
+                "support@stripe.com."
+            )
+            err = "%s: %s" % (type(e).__name__, str(e))
+            should_retry = True
+        # Catch remaining request exceptions
+        elif isinstance(e, aiohttp.ClientResponseError):
+            msg = (
+                "Unexpected error communicating with Stripe.  "
+                "If this problem persists, let us know at "
+                "support@stripe.com."
+            )
+            err = "%s: %s" % (type(e).__name__, str(e))
+            should_retry = False
+        else:
+            msg = (
+                "Unexpected error communicating with Stripe. "
+                "It looks like there's probably a configuration "
+                "issue locally.  If this problem persists, let us "
+                "know at support@stripe.com."
+            )
+            err = "A %s was raised" % (type(e).__name__,)
+            if str(e):
+                err += " with error message %s" % (str(e),)
+            else:
+                err += " with no error message"
+            should_retry = False
+
+        msg = textwrap.fill(msg) + "\n\n(Network error: %s)" % (err,)
+        raise error.APIConnectionError(msg, should_retry=should_retry)
+
+    async def close(self):
+        if self._session is not None:
+            await self._session.close()
